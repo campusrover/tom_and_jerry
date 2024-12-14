@@ -18,7 +18,7 @@ JERRY_OBJ_THRESHOLD = 0.3
 
 class TomAndJerry:
     def __init__(self):
-        rospy.init_node('tom_robot', anonymous=True)
+        rospy.init_node('tom_and_jerry', anonymous=True)
         self.tom_vel_pub = rospy.Publisher('rafael/cmd_vel', Twist, queue_size=10)
         self.jerry_vel_pub = rospy.Publisher('/cmd_vel', Twist, queue_size=10)
         self.rate = rospy.Rate(10)
@@ -30,6 +30,18 @@ class TomAndJerry:
         # Subscribe to Tom's odom and Jerry's odom
         rospy.Subscriber('/tom_odom', Point, self.tom_odom_cb)
         rospy.Subscriber('/jerry_odom', Point, self.jerry_odom_cb)
+
+        self.jerry_image_sub = rospy.Subscriber('/raspicam_node/image/compressed', CompressedImage, self.jerry_image_cb)
+        self.target_color = 'red'  # Target color (e.g., 'red', 'green', 'blue')
+        self.bridge = CvBridge()
+
+        # Define color range in HSV
+        self.color_ranges = {
+            "red": ((74, 105, 129), (180, 255, 255)),
+            "blue": ((100, 150, 0), (140, 255, 255)),
+            "green": ((35, 40, 40), (85, 255, 255)),
+            "yellow": ((20, 150, 150), (30, 255, 255)) 
+        }
 
         self.tom_x = None
         self.tom_y = None
@@ -75,6 +87,71 @@ class TomAndJerry:
         self.tom_x = msg.x
         self.tom_y = msg.y
         self.tom_yaw = msg.z
+    
+    def jerry_image_cb(self, msg):
+        # Convert the compressed image to OpenCV format
+        np_arr = np.frombuffer(msg.data, np.uint8)  # Convert byte data to numpy array
+        frame = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)  # Decode into an image
+
+        # Check if the frame was read successfully
+        if frame is None:
+            rospy.logwarn("Failed to decode image!")
+            return
+
+        # Convert image to HSV color space
+        hsv_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+
+        # Create a mask for the target color
+        mask = cv2.inRange(hsv_frame, self.lower_color, self.upper_color)
+
+        # Find contours of the detected color
+        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+        if contours:
+            self.target_found = True
+            largest_contour = max(contours, key=cv2.contourArea)
+            # Get the center of the largest contour
+            M = cv2.moments(largest_contour)
+            if M["m00"] != 0:
+                cX = int(M["m10"] / M["m00"])
+                cY = int(M["m01"] / M["m00"])
+                if self.jerry_robot_state["finding_block"]:
+                    self.move_towards_block(cX, cY, frame)
+        else:
+            self.target_found = False
+    
+    def move_towards_block(self, x, y, frame):
+        # Robot motion parameters
+        center_x = 320  # Assume image width is 640px
+        center_y = 240  # Assume image height is 480px
+        stop_distance = 30  # pixels, when to stop before the block
+        threshold_distance = 50  # pixels, threshold for movement
+
+        # Compute error in x and y directions
+        error_x = center_x - x
+        error_y = center_y - y
+
+        # Visualize the detection
+        cv2.circle(frame, (x, y), 10, (0, 255, 0), -1)
+        cv2.imshow("Detected Frame", frame)
+        cv2.waitKey(1)
+
+        # Print the error values for debugging
+        rospy.loginfo(f"Error X: {error_x}, Error Y: {error_y}")
+
+        # Move the robot directly towards the block by adjusting its linear velocity
+        if abs(error_y) > threshold_distance:
+            self.jerry_linear_vel = 0.1  # Move slower to approach the object
+        else:
+            self.jerry_linear_vel = 0.0  # Stop moving forward when close enough
+
+        # Adjust the angular velocity based on the error_x
+        if abs(error_x) > threshold_distance:
+            # Proportional control for angular velocity
+            angular_velocity_factor = 0.005  # Adjust this factor for more/less rotation speed
+            self.jerry_angular_vel = angular_velocity_factor * error_x  # Rotate proportionally to error_x
+        else:
+            self.jerry_angular_vel = 0.0  # Stop rotating when aligned
     
     def tom_scan_cb(self, msg):
         for key in self.tom_div_distance.keys():
@@ -139,6 +216,40 @@ class TomAndJerry:
         # The avoid_angular_vel is 0.8, and it's sign is the same as the sign of the regional difference
         # We do the max(1, ) thing to avoid division by 0 when the regional difference is 0
         self.tom_robot_state["avoid_angular_vel"] = ((region_diff/max(1, abs(region_diff))) * 0.8)
+    
+    def calc_jerry_robot_state(self):
+        nearest = math.inf
+        region_diff = 0
+        # Regional differences are calculated relative to the front region
+        goal = "0"
+        # The 4th region gives the highest regional diff so we start with that
+        max_destination = "4"
+        max_distance = 0
+
+        for key, value in self.jerry_div_distance.items():
+            region_diff = abs(self.jerry_div_cost[key] - self.jerry_div_cost[goal])
+            
+            # If there're no obstacles in that region
+            if not len(value):
+                # Find the obstacle-free region closest to the front
+                if (region_diff < nearest):
+                    nearest = region_diff
+                    max_distance = JERRY_OBJ_THRESHOLD
+                    max_destination = key
+            # Check if the region is the most "obstacle-free", i.e. the LIDAR distance is the highest
+            elif max(value) > max_distance:
+                max_distance = max(value)
+                max_destination = key
+
+        # Difference between the most obstacle-free region and the front
+        region_diff = self.jerry_div_cost[max_destination] - self.jerry_div_cost[goal]
+
+        # If the obstacle free path closest to the front is not the front (i.e. nearest != 0),
+        # this means that there is an obstacle in the front
+        self.jerry_robot_state["obstacle_detected"] = (nearest != 0)
+        # The avoid_angular_vel is 0.7, and it's sign is the same as the sign of the regional difference
+        # We do the max(1, ) thing to avoid division by 0 when the regional difference is 0
+        self.jerry_robot_state["avoid_angular_vel"] = ((region_diff/max(1, abs(region_diff))) * 0.7)
 
     def tom_go_to_jerry(self):
         # Calculate distance between Tom and Jerry
@@ -159,6 +270,21 @@ class TomAndJerry:
             # If no obstacle is in way, move towards Jerry
             self.tom_linear_vel = 0.2
             self.tom_angular_vel = delta_theta
+    
+    def jerry_go_to_goal(self):
+        distance = math.sqrt((self.jerry_goal_x - self.jerry_x)**2 + (self.jerry_goal_y - self.jerry_y)**2)
+        
+        phi = math.atan2(self.jerry_goal_y - self.jerry_y, self.jerry_goal_x - self.jerry_x)
+        
+        delta_theta = phi - self.jerry_yaw
+        delta_theta = (delta_theta + math.pi) % (2 * math.pi) - math.pi  # Normalize to [-pi, pi]
+        
+        if self.jerry_robot_state["obstacle_detected"]:
+            self.jerry_linear_vel = -0.05
+            self.jerry_angular_vel = self.jerry_robot_state["avoid_angular_vel"]
+        else:
+            self.jerry_linear_vel = 0.2
+            self.jerry_angular_vel = delta_theta
 
     def run_game(self):
         while self.jerry_x is None or self.tom_x is None:
@@ -168,6 +294,11 @@ class TomAndJerry:
             # Make Tom move towards Jerry while avoiding obstacles
             self.calc_tom_robot_state()
             self.tom_go_to_jerry()
+
+            # If Jerry is still in the obstacle course, then Jerry moves towards goal coordinate while avoiding obstacles
+            if not(self.jerry_robot_state["finding_block"]):
+                self.calc_jerry_robot_state()
+                self.jerry_go_to_goal()
 
             rospy.loginfo(f"Tom coordinates: ({self.tom_x}, {self.tom_y})")
             rospy.loginfo(f"Jerry coordinates: ({self.jerry_x}, {self.jerry_y})")
@@ -185,19 +316,42 @@ class TomAndJerry:
             rospy.loginfo("")
 
             cmd_vel_tom = Twist()
+            cmd_vel_jerry = Twist()
 
             # If Tom catches up to Jerry, pause everything and declare Tom wins
             if tom_distance_to_jerry < self.caught_threshold:
                 cmd_vel_tom.linear.x = 0
                 cmd_vel_tom.angular.z = 0
+                cmd_vel_jerry.linear.x = 0
+                cmd_vel_jerry.angular.z = 0
                 self.tom_vel_pub.publish(cmd_vel_tom)
+                self.jerry_vel_pub.publish(cmd_vel_jerry)
                 rospy.loginfo("Tom caught Jerry! Tom Wins!")
+                break
+            
+            # If Jerry reached end of obstacle course, switch to finding colored block mode
+            if jerry_distance_to_goal < 0.11:
+                self.jerry_robot_state["finding_block"] = True
+            
+            # If Jerry is close enough to colored block, pause everything and declare Jerry wins
+            if self.jerry_x > 2.5:
+                cmd_vel_tom.linear.x = 0
+                cmd_vel_tom.angular.z = 0
+                cmd_vel_jerry.linear.x = 0
+                cmd_vel_jerry.angular.z = 0
+                self.tom_vel_pub.publish(cmd_vel_tom)
+                self.jerry_vel_pub.publish(cmd_vel_jerry)
+                rospy.loginfo("Jerry reached Goal! Jerry Wins!")
                 break
 
             cmd_vel_tom.linear.x = self.tom_linear_vel
             cmd_vel_tom.angular.z = self.tom_angular_vel
 
+            cmd_vel_jerry.linear.x = self.jerry_linear_vel
+            cmd_vel_jerry.angular.z = self.jerry_angular_vel
+
             self.tom_vel_pub.publish(cmd_vel_tom)
+            self.jerry_vel_pub.publish(cmd_vel_jerry)
             self.rate.sleep()
 
 
